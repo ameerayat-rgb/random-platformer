@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>עולם אקראי</title>
+<style>
+  :root { --ink:#fff7ee; --sun:#ffc857; --panel:rgba(24,18,52,.88); }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:#1b1640; color:var(--ink);
+    font-family:"Rubik","Heebo",system-ui,sans-serif; overflow:hidden; touch-action:none; user-select:none; }
+  canvas { display:block; width:100%; height:100%; }
+  #msg { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:12px; background:var(--panel); text-align:center; padding:24px; }
+  #msg h1 { margin:0; font-size:46px; }
+  #msg p { margin:0; max-width:46ch; line-height:1.55; font-size:17px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  button { font:inherit; font-size:18px; padding:10px 26px; border:0; border-radius:999px;
+    background:var(--sun); color:#2a1d4d; cursor:pointer; }
+  button.alt { background:transparent; color:var(--ink); border:2px solid var(--ink); }
+  button:focus-visible { outline:3px solid #7ee8d8; outline-offset:3px; }
+  #mute { position:fixed; top:8px; inset-inline-end:10px; padding:6px 12px; font-size:18px;
+    background:rgba(255,255,255,.2); color:inherit; z-index:2; }
+  #pad { position:fixed; bottom:16px; inset-inline:16px; display:none; justify-content:space-between; }
+  #pad div { width:78px; height:78px; border-radius:50%; background:rgba(255,255,255,.22);
+    display:flex; align-items:center; justify-content:center; font-size:30px; }
+  @media (pointer:coarse) { #pad.on { display:flex; } }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<button id="mute" aria-label="השתק או בטל השתקה">🔊</button>
+<div id="pad"><span class="row"><div id="bl">◀</div><div id="br">▶</div></span><div id="bj">▲</div></div>
+<div id="msg"></div>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+let W, H, D = 1;
+function resize() {
+  D = devicePixelRatio || 1; W = innerWidth; H = innerHeight;
+  cv.width = W * D; cv.height = H * D;
+}
+addEventListener('resize', resize); resize();
+
+// ---- seeded random: same seed always gives the same level ----
+function rng(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+const T = 40, WALK = 4.6, GRAV = .55, JUMP = 12.5;
+const ICON = { freeze:'❄️', speed:'⚡', shield:'🛡️' };
+let seed, lvl, mode = 1, plats, spikes, coins, foes, saws, fires, winds, items, cflags, flag, total,
+    players = [], state = 'menu', shake = 0, winner = null, freezeT = 0, cp, ropeLen = 280;
+
+function parseHash() {
+  const m = location.hash.match(/^#(\d+)(?:-(\d+))?$/);
+  seed = m ? +m[1] : Math.floor(Math.random() * 99999); lvl = m && m[2] ? +m[2] : 1;
+}
+
+function mk(i) {
+  return { id:i, x:0, y:0, w:26, h:34, vx:0, vy:0, ground:false, coy:0, buf:0, dir:1, score:0, deaths:0,
+    shield:false, item:null, frozen:0, boost:0, inv:0, dead:0, fin:false, onP:null, safe:null,
+    k:{ left:false, right:false, jump:false, use:false }, col:['#ffc857', '#6ec6ff'][i] };
+}
+
+// Level generation. Safety margins: a rise of at most 2 tiles and a gap of at most 3 tiles
+// are well inside the player's jump (about 3.5 tiles high and 5 tiles long).
+function build() {
+  const r = rng(seed * 31 + lvl);
+  plats = []; spikes = []; coins = []; foes = []; saws = []; fires = []; winds = []; items = []; cflags = [];
+  let x = 0, row = 10; const count = 10 + lvl * 4;
+  for (let i = 0; i <= count; i++) {
+    const last = i === count, first = i === 0;
+    const w = first || last ? 8 : 4 + Math.floor(r() * 5);
+    const p = { x:x * T, y:row * T, w:w * T, h:T };
+    plats.push(p);
+    const isCp = !first && !last && i % 4 === 0;
+    if (isCp) cflags.push({ x:p.x + p.w / 2, y:p.y - 70, w:30, h:70, on:false });
+    if (!first && !last && !isCp) {
+      // Hazards keep the first and last tiles of a platform free, so a landing spot always exists.
+      const types = ['wind', 'crumble'];
+      if (w >= 6) types.push('spike', 'foe', 'saw');
+      if (w >= 7) types.push('fire');
+      const place = k => {
+        if (k === 'spike') { const sx = p.x + (2 + Math.floor(r() * (w - 4))) * T; spikes.push({ x:sx, y:p.y - T * .5, w:T, h:T * .5 }); }
+        else if (k === 'foe') foes.push({ x:p.x + T * 2, y:p.y - 24, w:28, h:24, d:1, a:p.x + T, b:p.x + p.w - T, alive:true });
+        else if (k === 'saw') saws.push({ x:p.x + T * 2, y:p.y - 22, r:18, a:p.x + T + 18, b:p.x + p.w - T - 18, d:1, sp:2.2 + lvl * .25, ang:0 });
+        else if (k === 'fire') {                          // from level 2 the bar has two opposite arms
+          const sp = (r() < .5 ? -1 : 1) * (.04 + lvl * .006), a0 = r() * 6.28;
+          for (let a = 0; a < (lvl >= 2 ? 2 : 1); a++) fires.push({ px:p.x + p.w / 2, py:p.y - 95, ang:a0 + a * Math.PI, sp });
+        }
+        else if (k === 'crumble') { p.crumble = true; p.y0 = p.y; p.t = 0; }
+        else winds.push({ x:p.x + p.w / 2 - T, y:p.y - 320, w:T * 2, h:320 });
+      };
+      if (r() < Math.min(.97, .8 + lvl * .04)) {
+        const k = types[Math.floor(r() * types.length)];
+        place(k);
+        // wide platforms can carry a second, different hazard
+        if (w >= 7 && (k === 'spike' || k === 'foe' || k === 'saw') && r() < .3 + lvl * .08)
+          place(['spike', 'foe', 'saw'].filter(q => q !== k)[Math.floor(r() * 2)]);
+      }
+      if (r() < .7) for (let k = 0; k < 3; k++) coins.push({ x:p.x + p.w / 2 - T + k * T, y:p.y - 70 - Math.sin(k * 1.6) * 18, got:false });
+      if (r() < .4) {                                   // power-up box
+        const kinds = ['freeze', 'speed', 'shield'];
+        items.push({ x:p.x + T * (1 + Math.floor(r() * (w - 2))) + 6, y:p.y - 50, w:28, h:28, type:kinds[Math.floor(r() * kinds.length)], got:false });
+      }
+    }
+    const dy = Math.floor(r() * 6) - 2;                  // -2 (up) .. +3 (down)
+    const gap = dy <= -2 ? 1 + Math.floor(r() * 2) : dy === -1 ? 1 + Math.floor(r() * 3) : 2 + Math.floor(r() * 3); // wider gaps, still within jump range
+    row = Math.min(13, Math.max(5, row + dy));
+    x += w + gap;
+  }
+  const lp = plats[plats.length - 1];
+  flag = { x:lp.x + lp.w / 2, y:lp.y - 90, w:30, h:90 };
+  total = coins.length; winner = null; shake = 0; freezeT = 0;
+  players = mode === 2 ? [mk(0), mk(1)] : [mk(0)];
+  cp = { x:30, y:plats[0].y - 40 }; ropeLen = ROPE;
+  for (const pl of players) { pl.x = cp.x + pl.id * 16; pl.y = cp.y; pl.safe = { x:pl.x, y:pl.y }; }
+  updateCamera(true);
+  $('pad').classList.toggle('on', mode === 1);
+}
+function respawn(pl) {
+  pl.x = cp.x + pl.id * 16; pl.y = cp.y; pl.vx = pl.vy = 0; pl.frozen = 0; pl.boost = 0; pl.inv = 45; pl.safe = { x:pl.x, y:pl.y }; pl.onP = null;
+}
+
+// ---- input ----
+function keyMap(code) {
+  const two = mode === 2;
+  switch (code) {
+    case 'KeyA': return [0, 'left'];  case 'KeyD': return [0, 'right'];
+    case 'KeyW': return [0, 'jump'];  case 'KeyS': return [0, 'use'];
+    case 'ArrowLeft': return [two ? 1 : 0, 'left'];   case 'ArrowRight': return [two ? 1 : 0, 'right'];
+    case 'ArrowUp': return [two ? 1 : 0, 'jump'];     case 'ArrowDown': return [two ? 1 : 0, 'use'];
+    case 'Space': return two ? null : [0, 'jump'];
+  }
+  return null;
+}
+function press(i, a, v) {
+  const pl = players[i]; if (!pl) return;
+  if (v && !pl.k[a]) { if (a === 'jump') pl.buf = 7; if (a === 'use') useItem(pl); }
+  pl.k[a] = v;
+}
+addEventListener('keydown', e => {
+  const m = keyMap(e.code);
+  if (m) { press(m[0], m[1], true); e.preventDefault(); }
+  if (state === 'play' || state === 'win') {
+    if (e.code === 'KeyR') newLevel(false);
+    if (e.code === 'KeyN') newLevel(true);
+  }
+  if (e.code === 'KeyM') toggleMute();
+});
+addEventListener('keyup', e => { const m = keyMap(e.code); if (m) press(m[0], m[1], false); });
+addEventListener('blur', () => players.forEach(pl => { for (const a in pl.k) pl.k[a] = false; }));
+[['bl', 'left'], ['br', 'right'], ['bj', 'jump']].forEach(([id, k]) => {
+  const el = $(id);
+  el.addEventListener('pointerdown', e => { press(0, k, true); e.preventDefault(); });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => el.addEventListener(ev, () => press(0, k, false)));
+});
+
+// ---- sound: generated with Web Audio, no files ----
+let AC, master, musicG, muted = false, nextT = 0, step16 = 0;
+const MEL = [12,0,10,0,7,0,10,0, 12,0,15,0,12,10,7,0, 5,0,7,0,10,0,7,0, 5,3,5,7,3,0,0,0];
+const BASS = [0,-4,-2,-5];
+function initAudio() {
+  try {
+    if (!AC) {
+      AC = new (window.AudioContext || window.webkitAudioContext)();
+      master = AC.createGain(); master.gain.value = muted ? 0 : .6; master.connect(AC.destination);
+      musicG = AC.createGain(); musicG.gain.value = .18; musicG.connect(master);
+      nextT = AC.currentTime + .1; setInterval(sched, 100);
+    }
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+}
+function tone(f, d, type, v, to, when, dest) {
+  if (!AC) return;
+  const t = AC.currentTime + Math.max(0, when || 0), o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || 'square'; o.frequency.setValueAtTime(f, t);
+  if (to) o.frequency.exponentialRampToValueAtTime(to, t + d);
+  g.gain.setValueAtTime(v || .2, t); g.gain.exponentialRampToValueAtTime(.001, t + d);
+  o.connect(g); g.connect(dest || master); o.start(t); o.stop(t + d + .02);
+}
+function sched() {
+  while (AC && nextT < AC.currentTime + .3) {
+    const s = step16 % 32, w = nextT - AC.currentTime;
+    if (MEL[s]) tone(220 * 2 ** (MEL[s] / 12), .18, 'square', .5, 0, w, musicG);
+    if (s % 4 === 0) tone(110 * 2 ** (BASS[s >> 3] / 12), .35, 'triangle', .9, 0, w, musicG);
+    step16++; nextT += .22;
+  }
+}
+function toggleMute() {
+  muted = !muted; if (master) master.gain.value = muted ? 0 : .6;
+  $('mute').textContent = muted ? '🔇' : '🔊'; $('mute').blur();
+}
+$('mute').onclick = toggleMute;
+const sfx = {
+  jump: () => tone(300, .15, 'square', .12, 600),
+  coin: () => { tone(880, .08, 'square', .1); tone(1320, .12, 'square', .1, 0, .07); },
+  crack: () => tone(140, .18, 'sawtooth', .1, 60),
+  stomp: () => tone(220, .12, 'square', .15, 80),
+  die: () => { tone(500, .5, 'sawtooth', .22, 50); tone(250, .5, 'square', .12, 40); },
+  flag: () => [523, 659, 784, 1047].forEach((f, i) => tone(f, .25, 'triangle', .3, 0, i * .09)),
+  win: () => [523, 659, 784, 1047, 784, 1047, 1319].forEach((f, i) => tone(f, .3, 'triangle', .3, 0, i * .12)),
+  power: () => { tone(660, .12, 'triangle', .25); tone(990, .16, 'triangle', .25, 0, .08); },
+  freeze: () => { tone(1400, .5, 'sine', .25, 250); tone(900, .4, 'triangle', .15, 200, .05); },
+  boost: () => tone(300, .3, 'square', .12, 1400),
+  shield: () => { tone(250, .35, 'triangle', .35, 1000); tone(500, .25, 'sine', .2, 1500, .05); },
+};
+
+// ---- game logic ----
+const cr = (cx, cy, r, b) => { const nx = Math.max(b.x, Math.min(cx, b.x + b.w)), ny = Math.max(b.y, Math.min(cy, b.y + b.h)); return (cx - nx) ** 2 + (cy - ny) ** 2 < r * r; };
+const hit = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+function useItem(pl) {
+  if (state !== 'play' || !pl.item) return;
+  if (pl.item === 'freeze') { freezeT = 240; sfx.freeze(); }
+  else if (pl.item === 'speed') { pl.boost = 240; sfx.boost(); }
+  pl.item = null;
+}
+// A shield absorbs one death: hazards just knock you up, a fall puts you back on the last solid ground.
+function die(pl) {
+  if (pl.inv > 0 || pl.dead > 0) return;
+  if (pl.shield) { pl.shield = false; pl.inv = 90; pl.vy = -9; sfx.shield(); return; }
+  pl.deaths++; shake = 8; sfx.die(); ropeLen = ROPE;
+  for (const q of players) { respawn(q); q.fin = false; if (players.length === 2) { q.dead = 70; q.inv = 0; } }   // shared fate: both go back to the flag
+}
+function stepPlayer(pl) {
+  if (pl.dead > 0) { pl.dead--; if (!pl.dead) respawn(pl); return; }
+  const k = pl.k, fz = pl.frozen > 0;
+  const rid = pl.onP && !(pl.onP.dead > 0) ? pl.onP : null; pl.onP = null;   // standing on the partner's head
+  const dir = fz ? 0 : (k.right ? 1 : 0) - (k.left ? 1 : 0);
+  if (dir) pl.dir = dir;
+  pl.vx += (dir * WALK * (pl.boost > 0 ? 1.55 : 1) - pl.vx) * .25;
+  pl.vy = Math.min(pl.vy + GRAV + (!k.jump && pl.vy < -4 ? .6 : 0), 14);
+  for (const z of winds) if (hit(pl, z)) pl.vy = Math.max(pl.vy - 1, -7);
+  pl.coy = pl.ground ? 6 : pl.coy - 1; pl.buf--;
+  if (pl.buf > 0 && pl.coy > 0 && !fz) { pl.vy = -JUMP; pl.buf = 0; pl.coy = 0; sfx.jump(); }
+  pl.x += pl.vx + (rid ? rid.vx : 0);
+  for (const p of plats) if (!(p.t < 0) && hit(pl, p)) { pl.x = pl.vx > 0 ? p.x - pl.w : p.x + p.w; pl.vx = 0; }
+  pl.y += pl.vy; pl.ground = false;
+  for (const p of plats) if (!(p.t < 0) && hit(pl, p)) {
+    if (pl.vy > 0) {
+      pl.y = p.y - pl.h; pl.ground = true;
+      if (!p.crumble) pl.safe = { x:pl.x, y:pl.y };
+      else if (!p.trig) { p.trig = true; p.t = 28; sfx.crack(); }
+    } else pl.y = p.y + p.h;
+    pl.vy = 0;
+  }
+  const o = players.length === 2 ? players.find(q => q !== pl) : null;
+  if (o && !(o.dead > 0) && !pl.ground && pl.vy >= 0) {   // the partner is a one-way platform: land on top, walk through from the sides
+    const prevBottom = pl.y - pl.vy + pl.h;
+    if (prevBottom <= o.y + 6 && pl.y + pl.h > o.y && pl.x + pl.w - 4 > o.x && pl.x + 4 < o.x + o.w) { pl.y = o.y - pl.h; pl.vy = 0; pl.ground = true; pl.onP = o; }
+  }
+  if (pl.x < 0) { pl.x = 0; pl.vx = 0; }
+  if (pl.y > 700 && !(o && !(o.dead > 0) && o.y < 700)) {   // with a partner still up, the rope holds you instead
+    if (pl.shield) { pl.shield = false; pl.inv = 90; sfx.shield(); }
+    if (pl.inv > 0) { pl.x = pl.safe.x; pl.y = pl.safe.y; pl.vx = pl.vy = 0; } else die(pl);
+    return;
+  }
+  for (const s of spikes) if (hit(pl, { x:s.x + 8, y:s.y + 6, w:s.w - 16, h:s.h - 6 })) die(pl);
+  for (const f of foes) if (f.alive && hit(pl, f)) {
+    if (pl.vy > 0 && pl.y + pl.h - f.y < 20) { f.alive = false; pl.vy = -9; shake = 4; sfx.stomp(); } else die(pl);
+  }
+  for (const sw of saws) if (cr(sw.x, sw.y, sw.r - 3, pl)) die(pl);
+  for (const f of fires) for (let j = 1; j <= 5; j++)
+    if (cr(f.px + Math.cos(f.ang) * j * 16, f.py + Math.sin(f.ang) * j * 16, 7, pl)) { die(pl); break; }
+  for (const c of coins) if (!c.got && Math.hypot(pl.x + 13 - c.x, pl.y + 17 - c.y) < 24) { c.got = true; pl.score++; sfx.coin(); }
+  for (const it of items) if (!it.got && hit(pl, it)) {
+    it.got = true; sfx.power();
+    if (it.type === 'shield') pl.shield = true; else pl.item = it.type;
+  }
+  for (const cf of cflags) if (!cf.on && hit(pl, cf)) { cf.on = true; cp = { x:cf.x - 11, y:cf.y + cf.h - pl.h }; sfx.flag(); }   // one checkpoint for the whole team
+  if (pl.frozen > 0) pl.frozen--; if (pl.boost > 0) pl.boost--; if (pl.inv > 0) pl.inv--;
+  if (hit(pl, flag)) { pl.fin = true; if (players.every(q => q.fin)) win(); }   // the whole team must reach the flag
+}
+
+// The two players are tied together. The rope is slack up to ROPE pixels, then pulls both toward each other.
+const ROPE = 280;   // 7 tiles: a bit more than one platform plus a gap
+let ropeAnchor = null, ropeTaut = false;
+// Slack up to ropeLen, then it pulls both players together. Whoever dangles lower is held at the end of the rope
+// (no pit death) and can climb back up by holding the jump key, which shortens the rope.
+// If a platform is between the two, the rope bends around its nearest top corner, like a rope over a ledge.
+function pullRope() {
+  ropeAnchor = null; ropeTaut = false;
+  const [a, b] = players; if (a.dead > 0 || b.dead > 0) return;
+  const low = a.y > b.y ? a : b, high = low === a ? b : a;
+  const lx = low.x + 13, ly = low.y + 17, hx = high.x + 13, hy = high.y + 17;
+  let ax = hx, ay = hy, extra = 0;
+  for (let i = 1; i < 24; i++) {                                         // is a platform (plus half a body of margin) in the way?
+    const px = lx + (hx - lx) * i / 24, py = ly + (hy - ly) * i / 24;
+    const q = plats.find(c => !(c.t < 0) && px > c.x - 14 && px < c.x + c.w + 14 && py > c.y + 2 && py < c.y + c.h - 2);
+    if (q) { ax = lx > q.x + q.w / 2 ? q.x + q.w + 14 : q.x - 14; ay = q.y - 24; extra = Math.hypot(hx - ax, hy - ay); ropeAnchor = { x:ax, y:ay }; break; }
+  }
+  const dLow = Math.hypot(ax - lx, ay - ly) || 1, d = dLow + extra;
+  const ux = (ax - lx) / dLow, uy = (ay - ly) / dLow;                    // from the lower player toward the rope's anchor
+  const dangling = !low.ground && !low.onP && low.y + low.h > high.y + high.h - 12;
+  if (dangling && low.k.jump && d > ropeLen - 30) ropeLen = Math.max(20, ropeLen - 3);   // climbing shortens the rope
+  else if (!dangling) ropeLen = Math.min(ROPE, ropeLen + 4);
+  if (d <= ropeLen) return;
+  ropeTaut = true;
+  const f = Math.min((d - ropeLen) * .02, 1.1);
+  low.vx += ux * f; low.vy += uy * f * .5;
+  const hf = dangling && high.ground ? (extra > 1 ? 0 : .3) : 1;       // a partner standing on solid ground holds the weight and is not dragged off
+  if (extra > 1) { const hd = Math.hypot(ax - hx, ay - hy) || 1; high.vx += (ax - hx) / hd * f * .5 * hf; high.vy += (ay - hy) / hd * f * .25 * hf; }
+  else { high.vx -= ux * f * hf; high.vy -= uy * f * .5 * hf; }
+  if (dangling && d > ropeLen + 40) {                                   // hard limit: cancel the motion away from the anchor
+    const out = -(low.vx * ux + low.vy * uy);
+    if (out > 0) { low.vx += ux * out; low.vy += uy * out; }
+    low.vx += ux * (d - ropeLen - 40) * .15; low.vy += uy * (d - ropeLen - 40) * .15;
+  }
+}
+function update() {
+  for (const q of plats) if (q.trig) {                    // crumbling floors fall, then grow back
+    q.t--;
+    if (q.t < 0) { q.fv = (q.fv || 0) + .5; q.y += q.fv; if (q.t < -140) { q.trig = false; q.t = 0; q.fv = 0; q.y = q.y0; } }
+  }
+  if (freezeT > 0) freezeT--;
+  else {
+    for (const f of foes) if (f.alive) { f.x += f.d * (1.6 + lvl * .12); if (f.x < f.a || f.x + f.w > f.b) f.d *= -1; }
+    for (const sw of saws) { sw.x += sw.d * sw.sp; if (sw.x < sw.a || sw.x > sw.b) sw.d *= -1; sw.ang += sw.d * .3; }
+    for (const f of fires) f.ang += f.sp;
+  }
+  for (const pl of players) if (state === 'play') stepPlayer(pl);
+  if (players.length === 2) pullRope();
+  updateCamera(false);
+}
+
+function win() {
+  if (state !== 'play') return;
+  state = 'win'; sfx.win();
+  const coinsGot = players.reduce((n, q) => n + q.score, 0), falls = players.reduce((n, q) => n + q.deaths, 0);
+  $('msg').classList.remove('hidden');
+  $('msg').innerHTML = '<h1>' + (players.length > 1 ? 'הצוות הגיע ליעד!' : 'השלב הושלם') + '</h1><p>מטבעות ' + coinsGot + ' מתוך ' + total +
+    ', נפילות ' + falls + '</p><div class="row"><button id="nx">לשלב הבא</button><button class="alt" id="cp">העתק קישור לשלב</button><button class="alt" id="mn">לתפריט</button></div>';
+  $('nx').onclick = () => { seed++; lvl++; newLevel(false); };
+  $('mn').onclick = showMenu;
+  $('cp').onclick = async () => {
+    const link = location.href.split('#')[0] + '#' + seed + '-' + lvl;
+    try { await navigator.clipboard.writeText(link); $('cp').textContent = 'הועתק'; } catch (e) { $('cp').textContent = link; }
+  };
+}
+function newLevel(randomSeed) {
+  if (randomSeed) { seed = Math.floor(Math.random() * 99999); lvl = 1; }
+  try { history.replaceState(null, '', '#' + seed + '-' + lvl); } catch (e) { /* sandboxed preview: skip URL update */ }
+  $('msg').classList.add('hidden'); build(); state = 'play';
+}
+function startGame(m) { initAudio(); mode = m; parseHash(); newLevel(false); }
+function showMenu() {
+  state = 'menu'; players = []; $('pad').classList.remove('on');
+  $('msg').classList.remove('hidden');
+  $('msg').innerHTML = '<h1>עולם אקראי</h1>' +
+    '<p>אספו מטבעות ותיבות כוח והגיעו לדגל האדום. בשני שחקנים אתם קשורים בחבל, ושניכם צריכים להגיע לדגל. אם אחד מכם מת, שניכם חוזרים לדגל האחרון. מי שנופל לתהום נתלה על החבל ולא מת: החזיקו קפיצה כדי לטפס בחזרה. אפשר לעמוד אחד על הראש של השני, אבל לא לחסום זה את זה מהצדדים.</p>' +
+    '<p>🛡️ מגן: מציל אתכם ממוות אחד. ⚡ מהירות: ריצה מהירה ל-4 שניות. ❄️ הקפאה: מקפיאה מסורים, מוטות אש ואויבים ל-4 שניות לכולם. פריט שאספתם מפעילים במקש השימוש.</p>' +
+    '<p>שחקן 1: A ו-D להליכה, W לקפיצה, S לשימוש בפריט.<br>שחקן 2: חצים להליכה וקפיצה, חץ למטה לשימוש בפריט.<br>בשחקן יחיד גם החצים והרווח עובדים. R מתחיל מחדש, N שלב חדש, M משתיק.</p>' +
+    '<div class="row"><button id="go1">שחקן אחד</button><button id="go2">שני שחקנים</button></div>';
+  $('go1').onclick = () => startGame(1);
+  $('go2').onclick = () => startGame(2);
+}
+showMenu();
+
+// ---- drawing: one shared view; the camera zooms out to keep both players on screen ----
+const cam = { x:0, y:0, s:1 };
+function updateCamera(snap) {
+  const base = H / 640;
+  let want = base, mid;
+  if (players.length === 2) {
+    const lo = Math.min(players[0].x, players[1].x), hi = Math.max(players[0].x, players[1].x) + 26;
+    want = Math.max(base * .5, Math.min(base, W / (hi - lo + 520)));
+    mid = (lo + hi) / 2;
+  } else mid = players[0].x + 13;
+  let topY = 0, span = 0;
+  if (players.length === 2) {                                   // zoom out vertically too when someone hangs far below
+    topY = Math.min(players[0].y, players[1].y) - 100; span = Math.max(players[0].y, players[1].y) + 134 - topY;
+    if (span > 640) want = Math.min(want, Math.max(base * .4, H / span));
+  }
+  cam.s = snap ? want : cam.s + (want - cam.s) * .06;
+  const vw = W / cam.s, vh = H / cam.s, tx = Math.max(0, mid - vw * (players.length === 2 ? .5 : .35));
+  const ty = span > 640 ? topY - (vh - span) / 2 : (640 - vh) / 2;
+  if (snap) { cam.x = tx; cam.y = ty; } else { cam.x += (tx - cam.x) * .12; cam.y += (ty - cam.y) * .12; }
+}
+function sky(vw, camX) {
+  const g = ctx.createLinearGradient(0, 0, 0, 640);
+  g.addColorStop(0, '#1b1640'); g.addColorStop(.6, '#7a3b8f'); g.addColorStop(1, '#ff9f7a');
+  ctx.fillStyle = '#1b1640'; ctx.fillRect(0, -2000, vw + 2, 2000);
+  ctx.fillStyle = '#120d2b'; ctx.fillRect(0, 640, vw + 2, 2000);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, vw + 2, 641);
+  ctx.fillStyle = 'rgba(255,200,87,.9)'; ctx.beginPath(); ctx.arc(vw * .75, 150, 46, 0, 7); ctx.fill();
+  for (let l = 0; l < 2; l++) {                       // two parallax hill layers
+    ctx.fillStyle = l ? 'rgba(48,24,84,.8)' : 'rgba(80,40,110,.55)'; ctx.beginPath(); ctx.moveTo(0, 641);
+    for (let x = 0; x <= vw + 20; x += 20) { const wx = x + camX * (.2 + l * .25);
+      ctx.lineTo(x, 470 + l * 60 - Math.sin(wx / (110 - l * 30)) * 40 - Math.sin(wx / 37) * 12); }
+    ctx.lineTo(vw + 20, 641); ctx.fill();
+  }
+}
+function drawPlayer(pl, t) {
+  if (pl.dead > 0) return;
+  const cx = pl.x + pl.w / 2, cy = pl.y + pl.h / 2;
+  if (pl.boost > 0) { ctx.fillStyle = 'rgba(255,255,255,.25)'; for (let j = 1; j <= 3; j++) ctx.fillRect(pl.x - pl.dir * j * 9, pl.y + 4, pl.w, pl.h - 8); }
+  ctx.globalAlpha = pl.inv > 0 && Math.floor(t / 80) % 2 ? .4 : 1;
+  ctx.fillStyle = pl.col; ctx.fillRect(pl.x, pl.y, pl.w, pl.h);
+  ctx.fillStyle = '#2a1d4d'; ctx.fillRect(pl.x + (pl.dir > 0 ? 15 : 5), pl.y + 8, 5, 7);
+  ctx.globalAlpha = 1;
+  if (pl.frozen > 0) { ctx.fillStyle = 'rgba(160,225,255,.6)'; ctx.fillRect(pl.x - 3, pl.y - 3, pl.w + 6, pl.h + 6); }
+  if (pl.shield) { ctx.fillStyle = 'rgba(155,231,255,.18)'; ctx.strokeStyle = 'rgba(155,231,255,.9)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx, cy, 27, 0, 7); ctx.fill(); ctx.stroke(); }
+  if (players.length > 1) { ctx.fillStyle = pl.col; ctx.font = 'bold 16px sans-serif'; ctx.textAlign = 'center'; ctx.fillText(pl.id + 1, cx, pl.y - 8); }
+}
+function drawWorld(t) {
+  const s = cam.s, vw = W / s;
+  ctx.setTransform(D * s, 0, 0, D * s, 0, -D * s * cam.y);
+  sky(vw, cam.x);
+  ctx.save();
+  const sx = shake > 0 ? (Math.random() - .5) * shake : 0; shake = Math.max(0, shake - .5);
+  ctx.translate(-cam.x + sx, 0);
+  for (const p of plats) {
+    const jx = p.trig && p.t > 0 ? (Math.random() - .5) * 3 : 0;
+    ctx.fillStyle = p.crumble ? '#5b3a6e' : '#2b1d55'; ctx.fillRect(p.x + jx, p.y, p.w, p.h);
+    ctx.fillStyle = p.crumble ? '#d9a7ff' : '#8fe388'; ctx.fillRect(p.x + jx, p.y, p.w, 9);
+    if (p.crumble) { ctx.strokeStyle = '#2b1d55'; ctx.lineWidth = 2; ctx.beginPath();
+      for (let cx = p.x + 20; cx < p.x + p.w; cx += 40) { ctx.moveTo(cx + jx, p.y + 9); ctx.lineTo(cx + 6 + jx, p.y + 24); ctx.lineTo(cx - 2 + jx, p.y + T); }
+      ctx.stroke(); }
+  }
+  ctx.fillStyle = '#ff5d73';
+  for (const sp of spikes) for (let k = 0; k < 2; k++) { ctx.beginPath(); ctx.moveTo(sp.x + k * 20, sp.y + sp.h);
+    ctx.lineTo(sp.x + k * 20 + 10, sp.y); ctx.lineTo(sp.x + k * 20 + 20, sp.y + sp.h); ctx.fill(); }
+  for (const z of winds) {
+    ctx.fillStyle = 'rgba(170,230,255,.10)'; ctx.fillRect(z.x, z.y, z.w, z.h);
+    ctx.strokeStyle = 'rgba(200,240,255,.55)'; ctx.lineWidth = 2; ctx.beginPath();
+    for (let k = 0; k < 6; k++) { const yy = z.y + z.h - ((t / 5 + k * 55) % z.h), xx = z.x + (k * 17 + 10) % z.w; ctx.moveTo(xx, yy); ctx.lineTo(xx, yy - 18); }
+    ctx.stroke();
+  }
+  for (const sw of saws) {
+    ctx.save(); ctx.translate(sw.x, sw.y); ctx.rotate(sw.ang); ctx.fillStyle = '#d9d4e8'; ctx.beginPath();
+    for (let k = 0; k < 16; k++) { const a = k * Math.PI / 8, rr = k % 2 ? sw.r - 5 : sw.r + 2; ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); }
+    ctx.fill(); ctx.fillStyle = '#6b5f8a'; ctx.beginPath(); ctx.arc(0, 0, 5, 0, 7); ctx.fill(); ctx.restore();
+  }
+  for (const f of fires) {
+    for (let k = 5; k >= 1; k--) { const bx = f.px + Math.cos(f.ang) * k * 16, by = f.py + Math.sin(f.ang) * k * 16;
+      ctx.fillStyle = 'rgba(255,140,60,.3)'; ctx.beginPath(); ctx.arc(bx, by, 12, 0, 7); ctx.fill();
+      ctx.fillStyle = k % 2 ? '#ffb347' : '#ff5d3a'; ctx.beginPath(); ctx.arc(bx, by, 7, 0, 7); ctx.fill(); }
+    ctx.fillStyle = '#3a2a66'; ctx.fillRect(f.px - 8, f.py - 8, 16, 16);
+  }
+  ctx.fillStyle = '#ffc857';
+  for (const c of coins) if (!c.got) { ctx.beginPath(); ctx.ellipse(c.x, c.y + Math.sin(t / 250 + c.x) * 3, 8 * Math.abs(Math.cos(t / 400 + c.x)) + 2, 9, 0, 0, 7); ctx.fill(); }
+  ctx.textAlign = 'center'; ctx.font = '20px sans-serif';
+  for (const it of items) if (!it.got) {
+    const bob = Math.sin(t / 300 + it.x) * 3;
+    ctx.fillStyle = 'rgba(255,247,238,.9)'; ctx.beginPath(); ctx.arc(it.x + 14, it.y + 14 + bob, 17, 0, 7); ctx.fill();
+    ctx.fillStyle = '#000'; ctx.fillText(ICON[it.type], it.x + 14, it.y + 21 + bob);
+  }
+  for (const f of foes) if (f.alive) { ctx.fillStyle = '#7ee8d8'; ctx.fillRect(f.x, f.y, f.w, f.h);
+    ctx.fillStyle = '#1b1640'; ctx.fillRect(f.x + 6, f.y + 6, 4, 5); ctx.fillRect(f.x + 18, f.y + 6, 4, 5); }
+  for (const cf of cflags) {                              // one pennant per player, lit in that player's colour
+    ctx.fillStyle = '#cfc3ff'; ctx.fillRect(cf.x, cf.y, 4, cf.h);
+    ctx.fillStyle = cf.on ? '#7ee8d8' : '#8d80b8'; ctx.beginPath(); ctx.moveTo(cf.x + 4, cf.y);
+    ctx.lineTo(cf.x + 28 + (cf.on ? Math.sin(t / 150) * 3 : 0), cf.y + 11); ctx.lineTo(cf.x + 4, cf.y + 22); ctx.fill();
+  }
+  ctx.fillStyle = '#fff7ee'; ctx.fillRect(flag.x, flag.y, 4, flag.h);
+  ctx.fillStyle = '#ff5d73'; ctx.beginPath(); ctx.moveTo(flag.x + 4, flag.y); ctx.lineTo(flag.x + 34 + Math.sin(t / 150) * 3, flag.y + 14); ctx.lineTo(flag.x + 4, flag.y + 28); ctx.fill();
+  if (players.length === 2 && !players[0].dead && !players[1].dead) {
+    const [a, b] = players, ax = a.x + 13, ay = a.y + 17, bx = b.x + 13, by = b.y + 17, d = Math.hypot(bx - ax, by - ay);
+    const sag = Math.min(90, Math.sqrt(Math.max(0, ropeLen * ropeLen - d * d)) * .45) * 1.6;
+    ctx.lineCap = 'round';
+    for (const [col, w] of [['#2a1d4d', 6], [ropeTaut ? '#ff8a6b' : '#f3e9d2', 3]]) {
+      ctx.strokeStyle = col; ctx.lineWidth = w; ctx.beginPath(); ctx.moveTo(ax, ay);
+      if (ropeAnchor) { ctx.lineTo(ropeAnchor.x, ropeAnchor.y); ctx.lineTo(bx, by); }
+      else ctx.quadraticCurveTo((ax + bx) / 2, (ay + by) / 2 + sag, bx, by);
+      ctx.stroke();
+    }
+  }
+  for (const pl of players) drawPlayer(pl, t);
+  ctx.restore();
+  if (freezeT > 0) { ctx.fillStyle = 'rgba(160,225,255,.12)'; ctx.fillRect(0, -2000, vw + 2, 4000); }
+}
+function drawHud() {
+  ctx.setTransform(D, 0, 0, D, 0, 0); ctx.direction = 'rtl'; ctx.textBaseline = 'alphabetic';
+  ctx.font = '600 16px Rubik, Heebo, system-ui, sans-serif'; ctx.shadowColor = 'rgba(0,0,0,.6)'; ctx.shadowBlur = 4;
+  players.forEach((me, i) => {
+    const parts = [];
+    if (me.item) parts.push(ICON[me.item] + ' מוכן (' + (mode === 2 ? (me.id ? '↓' : 'S') : 'S/↓') + ')');
+    if (me.shield) parts.push('🛡️ מגן'); if (me.boost > 0) parts.push('⚡ ' + Math.ceil(me.boost / 60)); if (me.dead > 0) parts.push('💀'); if (me.fin) parts.push('🚩');
+    ctx.fillStyle = me.col; ctx.textAlign = 'right';
+    ctx.fillText((players.length > 1 ? 'שחקן ' + (me.id + 1) + '   ' : '') + 'מטבעות ' + me.score + '/' + total + '   נפילות ' + me.deaths + (parts.length ? '   ' + parts.join('   ') : ''), W - 14, 26 + i * 24);
+  });
+  ctx.fillStyle = '#fff7ee'; ctx.textAlign = 'left'; ctx.fillText('שלב ' + lvl + '   זרע ' + seed + (freezeT > 0 ? '   ❄️ מכשולים קפואים ' + Math.ceil(freezeT / 60) : ''), 64, 26);
+  if (players.length === 2) {                           // race progress and off-screen arrows
+    const bw = Math.min(420, W * .5), x0 = (W - bw) / 2, y = H - 22;
+    ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.fillRect(x0, y, bw, 4);
+    ctx.fillStyle = '#ff5d73'; ctx.fillRect(x0 + bw - 3, y - 5, 3, 14);
+    for (const pl of players) {
+      ctx.fillStyle = pl.col; ctx.beginPath(); ctx.arc(x0 + bw * Math.max(0, Math.min(1, pl.x / flag.x)), y + 2, 7, 0, 7); ctx.fill();
+      const sxp = (pl.x - cam.x) * cam.s;
+      if (sxp < 8) { const yy = Math.max(60, Math.min(H - 60, (pl.y - cam.y) * cam.s));
+        ctx.beginPath(); ctx.moveTo(10, yy); ctx.lineTo(34, yy - 14); ctx.lineTo(34, yy + 14); ctx.fill();
+        ctx.fillStyle = '#1b1640'; ctx.textAlign = 'center'; ctx.fillText(pl.id + 1, 25, yy + 5); }
+    }
+  }
+  ctx.shadowBlur = 0;
+}
+function draw(t) {
+  ctx.setTransform(D, 0, 0, D, 0, 0); ctx.clearRect(0, 0, W, H);
+  if (!players.length) {                              // menu background
+    const s = H / 640; ctx.setTransform(D * s, 0, 0, D * s, 0, 0); sky(W / s, t / 40); return;
+  }
+  drawWorld(t); drawHud();
+}
+let last = 0, acc = 0;
+function loop(t) {
+  acc += Math.min(t - last, 100); last = t;
+  while (acc >= 1000 / 60) { if (state === 'play') update(); acc -= 1000 / 60; }
+  draw(t); requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
